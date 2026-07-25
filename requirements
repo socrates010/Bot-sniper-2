@@ -1,0 +1,10 @@
+flask==3.0.3
+ccxt>=4.4.0
+pandas>=2.0.0
+pandas_ta>=0.3.14b0
+requests>=2.31.0
+
+# Opcional, mas recomendado: acelera MUITO a assinatura ECDSA usada pela
+# Hyperliquid (de ~45ms para <0.05ms por chamada assinada). Sem isso o bot
+# funciona normalmente, só assina um pouco mais devagar.
+coincurve>=19.0.0
