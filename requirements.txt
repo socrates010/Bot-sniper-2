@@ -1,7 +1,12 @@
 flask==3.0.3
 ccxt>=4.4.0
-pandas>=2.0.0
-pandas_ta>=0.3.14b0
+# pandas travado em 2.x: pandas_ta ainda não é testado/estável contra o
+# pandas 3.x (lançado recentemente), que quebraria vários indicadores.
+pandas>=2.2.0,<3.0.0
+# A versão antiga (0.3.14b0) foi removida do PyPI em set/2025. As versões
+# atuais (0.4.x) exigem Python >= 3.12 — por isso fixamos Python 3.12 no
+# arquivo .python-version deste repositório.
+pandas_ta>=0.4.67b0
 requests>=2.31.0
  
 # coincurve foi removido de propósito: é um pacote OPCIONAL (só acelera a
