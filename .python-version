@@ -1,0 +1,3 @@
+git add .python-version
+   git commit -m "Fixar Python 3.11.9 para compatibilidade com numba/pandas_ta"
+   git push origin main
