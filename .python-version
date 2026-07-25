@@ -1,3 +1,4 @@
-git add .python-version
-   git commit -m "Fixar Python 3.11.9 para compatibilidade com numba/pandas_ta"
+git add requirements.txt .python-version
+   git rm runtime.txt  # se existir no repo
+   git commit -m "Fixar Python 3.12 (compatível com numba e pandas_ta atual)"
    git push origin main
