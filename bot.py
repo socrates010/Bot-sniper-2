@@ -167,6 +167,16 @@ if USE_TESTNET:
         log.warning(f"Não foi possível ativar sandbox mode: {e}. "
                     f"Verifique se a versão do ccxt instalada suporta set_sandbox_mode para hyperliquid.")
 
+# IMPORTANTE: exchange.market(symbol) (usado no diagnóstico de viabilidade e
+# no cálculo do preço de referência) é uma consulta LOCAL ao dicionário de
+# mercados do ccxt — ele não carrega nada sozinho. Sem chamar load_markets()
+# uma vez aqui, toda chamada a exchange.market() falha com "markets not loaded".
+try:
+    exchange.load_markets()
+    log.info(f"Mercados da Hyperliquid carregados ({len(exchange.markets)} pares disponíveis).")
+except Exception as e:
+    log.error(f"Falha ao carregar mercados da Hyperliquid no startup: {e}")
+
 # --- Monitoramento de saúde do loop principal ---
 HEARTBEAT_HORAS = float(os.getenv('HEARTBEAT_HORAS', 6))
 WATCHDOG_LIMITE_MINUTOS = float(os.getenv('WATCHDOG_LIMITE_MINUTOS', 10))
