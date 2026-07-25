@@ -3,8 +3,12 @@ ccxt>=4.4.0
 pandas>=2.0.0
 pandas_ta>=0.3.14b0
 requests>=2.31.0
-
-# Opcional, mas recomendado: acelera MUITO a assinatura ECDSA usada pela
-# Hyperliquid (de ~45ms para <0.05ms por chamada assinada). Sem isso o bot
-# funciona normalmente, só assina um pouco mais devagar.
-coincurve>=19.0.0
+ 
+# coincurve foi removido de propósito: é um pacote OPCIONAL (só acelera a
+# assinatura ECDSA da Hyperliquid) que costuma falhar ao compilar em versões
+# recentes do Python (ex: 3.14) por um problema de empacotamento do cffi/
+# hatchling, não do seu código. Sem ele o ccxt usa um fallback puro em
+# Python para assinar as chamadas — funciona normalmente, só um pouco mais
+# lento (imperceptível no ciclo do bot). Se quiser reativar no futuro, use
+# uma imagem com Python 3.11/3.12 e teste local antes de subir pro Render.
+ 
