@@ -6,6 +6,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 from flask import Flask
 import ccxt
@@ -84,23 +85,56 @@ SYMBOLS = [s.strip() for s in os.getenv(
     'SYMBOLS', 'BTC/USDC:USDC,ETH/USDC:USDC,SOL/USDC:USDC'
 ).split(',') if s.strip()]
 
-# --- Estratégias ativas ---
-# 'bb_breakout'     -> estratégia original (Bollinger Bands + volume), giro mais lento
-# 'momentum_scalp'  -> nova estratégia (EMA cross + RSI + ATR), giro rápido e mais alavancada
-# Pode rodar as duas ao mesmo tempo: 'bb_breakout,momentum_scalp'
-ESTRATEGIAS_ATIVAS = [s.strip() for s in os.getenv(
-    'ESTRATEGIAS_ATIVAS', 'bb_breakout,momentum_scalp'
+# --- Estratégias ativas e prioridade por turno ---
+# 'bb_breakout'     -> Bollinger Bands + volume, giro mais lento
+# 'momentum_scalp'  -> EMA cross + RSI + ATR, giro rápido e mais alavancada
+# A ordem da lista = prioridade: se as duas derem sinal no mesmo par no mesmo
+# ciclo, a primeira da lista abre a posição.
+#
+# No período da tarde (horário local, ver TIMEZONE_OPERACIONAL), o mercado
+# tende a perder amplitude/volume -> priorizamos o momentum_scalp (que lucra
+# com micro-movimentos) e só caímos pro bb_breakout se o scalp não sinalizar.
+TIMEZONE_OPERACIONAL = os.getenv('TIMEZONE_OPERACIONAL', 'America/Sao_Paulo')
+TURNO_TARDE_INICIO_HORA = int(os.getenv('TURNO_TARDE_INICIO_HORA', 12))  # 12h
+TURNO_TARDE_FIM_HORA = int(os.getenv('TURNO_TARDE_FIM_HORA', 18))        # 18h (exclusivo)
+
+ESTRATEGIAS_ORDEM_PADRAO = [s.strip() for s in os.getenv(
+    'ESTRATEGIAS_ORDEM_PADRAO', 'bb_breakout,momentum_scalp'
 ).split(',') if s.strip()]
+
+ESTRATEGIAS_ORDEM_TARDE = [s.strip() for s in os.getenv(
+    'ESTRATEGIAS_ORDEM_TARDE', 'momentum_scalp,bb_breakout'
+).split(',') if s.strip()]
+
+
+def obter_ordem_estrategias_atual() -> list:
+    """Retorna a lista de estratégias em ordem de prioridade, considerando
+    se o horário local atual cai dentro do turno da tarde configurado."""
+    agora_local = datetime.now(ZoneInfo(TIMEZONE_OPERACIONAL))
+    if TURNO_TARDE_INICIO_HORA <= agora_local.hour < TURNO_TARDE_FIM_HORA:
+        return ESTRATEGIAS_ORDEM_TARDE
+    return ESTRATEGIAS_ORDEM_PADRAO
+
 
 # --- Parâmetros da estratégia Sniper (BB breakout) ---
 TIMEFRAME = os.getenv('TIMEFRAME', '5m')
 BB_LENGTH = int(os.getenv('BB_LENGTH', 20))
-BB_STD = float(os.getenv('BB_STD', 2.0))
-VOLUME_MULTIPLICADOR = float(os.getenv('VOLUME_MULTIPLICADOR', 1.5))
+BB_STD = float(os.getenv('BB_STD', 1.5))
+# Antes: exigia volume > média(20) * multiplicador. Isso ficava alto demais
+# à tarde, quando o volume médio do dia todo (que inclui a manhã, mais forte)
+# não reflete o volume "normal" daquele momento. Agora comparamos com o
+# volume da vela FECHADA imediatamente anterior — régua mais realista pra
+# qualquer horário. O multiplicador também foi reduzido (1.5 -> 1.2) porque
+# comparar candle-a-candle já é naturalmente mais ruidoso que comparar com
+# uma média de 20 períodos.
+VOLUME_MULTIPLICADOR = float(os.getenv('VOLUME_MULTIPLICADOR', 1.2))
 LIMIT_CANDLES = max(100, BB_LENGTH * 3)
 
 FILTRO_TENDENCIA = os.getenv('FILTRO_TENDENCIA', 'true').lower() == 'true'
-EMA_TENDENCIA = int(os.getenv('EMA_TENDENCIA', 100))
+# EMA100 -> EMA34: filtro de tendência mais reativo, reage mais rápido a
+# mudanças de direção de curto/médio prazo (trade-off: mais sujeito a whipsaw
+# em mercado lateral do que a EMA100).
+EMA_TENDENCIA = int(os.getenv('EMA_TENDENCIA', 34))
 
 LEVERAGE = int(os.getenv('LEVERAGE', 3))
 PCT_TP = float(os.getenv('PCT_TP', 0.015))   # 1.5%
@@ -110,21 +144,57 @@ PCT_SL = float(os.getenv('PCT_SL', 0.01))    # 1.0%
 # Ideia: opera em timeframe curto, entra na confirmação de cruzamento de médias
 # com momentum (RSI) a favor, e usa ATR para dimensionar TP/SL de forma
 # adaptativa à volatilidade do momento (em vez de % fixo).
-SCALP_TIMEFRAME = os.getenv('SCALP_TIMEFRAME', '3m')
-SCALP_EMA_RAPIDA = int(os.getenv('SCALP_EMA_RAPIDA', 9))
-SCALP_EMA_LENTA = int(os.getenv('SCALP_EMA_LENTA', 21))
+# Timeframe 3m -> 2m e EMA9/21 -> EMA5/13: no 2m, médias mais lentas demoram
+# demais para cruzar quando o mercado perde amplitude (típico de tarde) —
+# médias mais curtas cruzam com mais frequência, gerando mais gatilhos.
+SCALP_TIMEFRAME = os.getenv('SCALP_TIMEFRAME', '2m')
+SCALP_EMA_RAPIDA = int(os.getenv('SCALP_EMA_RAPIDA', 5))
+SCALP_EMA_LENTA = int(os.getenv('SCALP_EMA_LENTA', 13))
 SCALP_RSI_LENGTH = int(os.getenv('SCALP_RSI_LENGTH', 14))
-SCALP_RSI_LONG_MIN = float(os.getenv('SCALP_RSI_LONG_MIN', 50))   # RSI mínimo p/ LONG
-SCALP_RSI_LONG_MAX = float(os.getenv('SCALP_RSI_LONG_MAX', 75))   # evita comprar sobrecomprado
-SCALP_RSI_SHORT_MAX = float(os.getenv('SCALP_RSI_SHORT_MAX', 50))  # RSI máximo p/ SHORT
-SCALP_RSI_SHORT_MIN = float(os.getenv('SCALP_RSI_SHORT_MIN', 25))  # evita vender sobrevendido
+# Faixa de RSI ampliada (35-65) em vez de duas faixas estreitas e opostas
+# (era 50-75 no LONG / 25-50 no SHORT). Ganha-se frequência de sinal, perde-se
+# a proteção contra comprar/vender em zona de RSI mais neutra — é a troca
+# consciente pedida (giro rápido > seletividade).
+SCALP_RSI_LONG_MIN = float(os.getenv('SCALP_RSI_LONG_MIN', 35))   # RSI mínimo p/ LONG
+SCALP_RSI_LONG_MAX = float(os.getenv('SCALP_RSI_LONG_MAX', 100))  # sem teto (era 75)
+SCALP_RSI_SHORT_MAX = float(os.getenv('SCALP_RSI_SHORT_MAX', 65))  # RSI máximo p/ SHORT
+SCALP_RSI_SHORT_MIN = float(os.getenv('SCALP_RSI_SHORT_MIN', 0))   # sem piso (era 25)
 SCALP_ATR_LENGTH = int(os.getenv('SCALP_ATR_LENGTH', 14))
-SCALP_ATR_MULT_TP = float(os.getenv('SCALP_ATR_MULT_TP', 1.5))
-SCALP_ATR_MULT_SL = float(os.getenv('SCALP_ATR_MULT_SL', 1.0))
+# Multiplicadores de ATR menores -> TP/SL mais apertados -> posições fecham
+# mais rápido -> libera margem pra próxima entrada mais cedo (giro rápido).
+SCALP_ATR_MULT_TP = float(os.getenv('SCALP_ATR_MULT_TP', 1.0))
+SCALP_ATR_MULT_SL = float(os.getenv('SCALP_ATR_MULT_SL', 0.8))
 SCALP_PCT_SL_MINIMO = float(os.getenv('SCALP_PCT_SL_MINIMO', 0.003))  # piso de 0.3%
 SCALP_PCT_TP_MAXIMO = float(os.getenv('SCALP_PCT_TP_MAXIMO', 0.05))   # teto de 5%
 SCALP_LEVERAGE = int(os.getenv('SCALP_LEVERAGE', 5))
 SCALP_LIMIT_CANDLES = max(100, max(SCALP_EMA_LENTA, SCALP_RSI_LENGTH, SCALP_ATR_LENGTH) * 3)
+
+# --- Filtro de liquidez / market cap ---
+# Objetivo: evitar operar (com alavancagem) tokens pequenos/pouco líquidos,
+# onde um único player consegue mover o preço e "caçar" stops com mais
+# facilidade. O market cap por token em tempo real é um dado do plano PAGO
+# da API do DefiLlama (US$300/mês) — o plano gratuito só libera preço/TVL/fees.
+# Como o próprio DefiLlama usa o CoinGecko como fonte para a maioria dos
+# tokens, usamos a API pública e gratuita do CoinGecko para o mesmo dado.
+FILTRO_MARKET_CAP_ATIVO = os.getenv('FILTRO_MARKET_CAP_ATIVO', 'true').lower() == 'true'
+MARKET_CAP_MINIMO_USD = float(os.getenv('MARKET_CAP_MINIMO_USD', 500_000_000))  # 500M USD
+MARKET_CAP_CACHE_MINUTOS = float(os.getenv('MARKET_CAP_CACHE_MINUTOS', 30))
+
+# Mapeamento símbolo (base, sem /USDC:USDC) -> id do CoinGecko. Cobre os pares
+# mais comuns; se você operar um par fora dessa lista, adicione aqui ou via
+# COINGECKO_IDS_EXTRA=BASE1:id1,BASE2:id2 (variável de ambiente).
+COINGECKO_IDS = {
+    'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'AVAX': 'avalanche-2',
+    'APT': 'aptos', 'ARB': 'arbitrum', 'OP': 'optimism', 'DOGE': 'dogecoin',
+    'XRP': 'ripple', 'BNB': 'binancecoin', 'SUI': 'sui', 'LINK': 'chainlink',
+    'ADA': 'cardano', 'LTC': 'litecoin', 'DOT': 'polkadot', 'NEAR': 'near',
+    'HYPE': 'hyperliquid', 'WLD': 'worldcoin-wld', 'TIA': 'celestia',
+    'INJ': 'injective-protocol', 'SEI': 'sei-network',
+}
+for _par in os.getenv('COINGECKO_IDS_EXTRA', '').split(','):
+    if ':' in _par:
+        _base, _id = _par.split(':', 1)
+        COINGECKO_IDS[_base.strip().upper()] = _id.strip()
 
 # Trava de segurança: nenhuma estratégia pode configurar alavancagem acima disso,
 # mesmo que a variável de ambiente correspondente esteja mal configurada.
@@ -404,28 +474,34 @@ def estrategia_bb_breakout(symbol: str):
     df = buscar_dados(symbol, TIMEFRAME, LIMIT_CANDLES)
 
     df.ta.bbands(close='close', length=BB_LENGTH, std=BB_STD, append=True)
-    df['vol_sma'] = ta.sma(df['volume'], length=20)
     if FILTRO_TENDENCIA:
         df['ema_tendencia'] = ta.ema(df['close'], length=EMA_TENDENCIA)
 
-    if len(df) < max(BB_LENGTH, EMA_TENDENCIA if FILTRO_TENDENCIA else 0) + 2:
+    if len(df) < max(BB_LENGTH, EMA_TENDENCIA if FILTRO_TENDENCIA else 0) + 3:
         return None
 
-    candle = df.iloc[-2]
+    candle = df.iloc[-2]        # último candle FECHADO (gatilho = fechamento, não pavio)
+    candle_anterior = df.iloc[-3]  # candle imediatamente anterior, usado como referência de volume
     close = candle['close']
     volume = candle['volume']
-    vol_sma = candle['vol_sma']
+    volume_anterior = candle_anterior['volume']
 
     col_lower = _coluna_bb(df, 'BBL_')
     col_upper = _coluna_bb(df, 'BBU_')
     bb_lower = candle[col_lower]
     bb_upper = candle[col_upper]
 
-    if pd.isna(vol_sma) or pd.isna(bb_lower) or pd.isna(bb_upper):
+    if pd.isna(volume_anterior) or pd.isna(bb_lower) or pd.isna(bb_upper):
         return None
 
-    volume_confirmado = volume > (vol_sma * VOLUME_MULTIPLICADOR)
+    # Antes: volume > média(20). Agora: volume > vela anterior * multiplicador.
+    # Fica mais justo ao longo do dia inteiro (a média de 20 velas carrega o
+    # volume mais forte da manhã e deixa a régua alta demais à tarde).
+    volume_confirmado = volume > (volume_anterior * VOLUME_MULTIPLICADOR)
 
+    # Gatilho pelo FECHAMENTO da vela acima/abaixo da banda (não pelo pavio/
+    # máxima) — usar candle['close'] em vez de candle['high']/['low'] já
+    # garante isso.
     sinal = None
     if close > bb_upper and volume_confirmado:
         sinal = 'LONG'
@@ -441,7 +517,7 @@ def estrategia_bb_breakout(symbol: str):
                 sinal = None
 
     log.info(f"[{symbol}][bb_breakout] Preço: {close:.4f} | BB Inf: {bb_lower:.4f} | BB Sup: {bb_upper:.4f} | "
-              f"Vol: {volume:.0f} (média: {vol_sma:.0f}) | Sinal: {sinal or '-'}")
+              f"Vol: {volume:.0f} (vela anterior: {volume_anterior:.0f}) | Sinal: {sinal or '-'}")
 
     if not sinal:
         return None
@@ -526,12 +602,14 @@ ESTRATEGIAS_DISPONIVEIS = {
 
 
 def avaliar_estrategias(symbol: str):
-    """Roda, em ordem, cada estratégia ativa para o símbolo e retorna o
-    primeiro sinal encontrado (ordem = prioridade, definida em ESTRATEGIAS_ATIVAS)."""
-    for nome in ESTRATEGIAS_ATIVAS:
+    """Roda, em ordem de prioridade, cada estratégia ativa para o símbolo e
+    retorna o primeiro sinal encontrado. A ordem muda sozinha conforme o
+    turno (ver obter_ordem_estrategias_atual / TURNO_TARDE_*)."""
+    ordem_atual = obter_ordem_estrategias_atual()
+    for nome in ordem_atual:
         func = ESTRATEGIAS_DISPONIVEIS.get(nome)
         if not func:
-            log.warning(f"Estratégia '{nome}' desconhecida em ESTRATEGIAS_ATIVAS, ignorando.")
+            log.warning(f"Estratégia '{nome}' desconhecida na ordem de prioridade atual, ignorando.")
             continue
         try:
             resultado = func(symbol)
@@ -786,7 +864,7 @@ def processar_par(symbol: str, aberta_agora: bool, ordens_do_par: list, total_po
     if total_posicoes_abertas >= MAX_POSICOES_SIMULTANEAS:
         return
 
-    log.info(f"[{symbol}] Buscando candles e avaliando estratégias ({', '.join(ESTRATEGIAS_ATIVAS)})...")
+    log.info(f"[{symbol}] Buscando candles e avaliando estratégias ({', '.join(obter_ordem_estrategias_atual())})...")
     resultado = avaliar_estrategias(symbol)
     if not resultado:
         return
@@ -825,7 +903,9 @@ def enviar_resumo_diario():
 def executar_bot():
     log.info("=" * 60)
     log.info(f"BOT SNIPER BOLADÃO (HYPERLIQUID) INICIADO | Pares: {', '.join(SYMBOLS)}")
-    log.info(f"Estratégias ativas: {', '.join(ESTRATEGIAS_ATIVAS)}")
+    log.info(f"Ordem de prioridade padrão: {', '.join(ESTRATEGIAS_ORDEM_PADRAO)}")
+    log.info(f"Ordem de prioridade no turno da tarde ({TURNO_TARDE_INICIO_HORA}h-{TURNO_TARDE_FIM_HORA}h, {TIMEZONE_OPERACIONAL}): "
+             f"{', '.join(ESTRATEGIAS_ORDEM_TARDE)}")
     log.info("=" * 60)
 
     try:
@@ -837,7 +917,9 @@ def executar_bot():
     enviar_mensagem_telegram(
         f"🤖 *Bot Sniper Boladão (Hyperliquid) Inicializado!*\n"
         f"Monitorando: `{', '.join(SYMBOLS)}`\n"
-        f"Estratégias: `{', '.join(ESTRATEGIAS_ATIVAS)}`\n"
+        f"Estratégias (ordem atual): `{', '.join(obter_ordem_estrategias_atual())}`\n"
+        f"(padrão: `{', '.join(ESTRATEGIAS_ORDEM_PADRAO)}` | tarde {TURNO_TARDE_INICIO_HORA}h-{TURNO_TARDE_FIM_HORA}h: "
+        f"`{', '.join(ESTRATEGIAS_ORDEM_TARDE)}`)\n"
         f"Máx. posições simultâneas: `{MAX_POSICOES_SIMULTANEAS}`\n"
         f"Risco por trade: `{RISCO_POR_TRADE_PCT*100:.1f}%` | Drawdown máx. diário: `{MAX_DRAWDOWN_DIARIO_PCT*100:.1f}%`\n"
         f"{'⚠️ MODO TESTNET' if USE_TESTNET else ''}"
