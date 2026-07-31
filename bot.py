@@ -81,9 +81,23 @@ NOTIFICAR_ERROS_NO_TELEGRAM = os.getenv('NOTIFICAR_ERROS_NO_TELEGRAM', 'true').l
 QUOTE = 'USDC'
 
 # Formato de símbolo na Hyperliquid (via ccxt) é "BASE/USDC:USDC", ex: "BTC/USDC:USDC".
+# Mercados HIP-3 (deploy de terceiros, ex: ações tokenizadas como SKHYNIX) podem
+# usar um formato com prefixo de dex (ex: "xyz:SKHYNIX/USDC:USDC") — o bot tenta
+# resolver automaticamente no startup (ver resolver_e_validar_symbols) e avisa
+# no log/Telegram qual símbolo exato foi encontrado ou se precisa de ajuste manual.
+#
+# ATENÇÃO SKHYNIX: é uma ação tokenizada (SK Hynix) via mercado HIP-3 de
+# terceiros (Trade.xyz), com oráculo próprio e cross margin — teve um evento
+# de ~US$57M em liquidações em 28/jul/2026 por falha de oráculo pré-mercado.
+# É estruturalmente mais arriscado que os pares cripto major abaixo.
 SYMBOLS = [s.strip() for s in os.getenv(
-    'SYMBOLS', 'BTC/USDC:USDC,ETH/USDC:USDC,SOL/USDC:USDC'
+    'SYMBOLS', 'BTC/USDC:USDC,ETH/USDC:USDC,SOL/USDC:USDC,SKHYNIX/USDC:USDC'
 ).split(',') if s.strip()]
+
+# Cópia da lista original de SYMBOLS: são os pares SEMPRE operados, independente
+# do que a seleção dinâmica de oportunidades (mais abaixo) decidir. A seleção
+# dinâmica só ADICIONA pares extras a este núcleo fixo, nunca remove um destes.
+SIMBOLOS_FIXOS = list(SYMBOLS)
 
 # --- Estratégias ativas e prioridade por turno ---
 # 'bb_breakout'     -> Bollinger Bands + volume, giro mais lento
@@ -218,6 +232,27 @@ for _par in os.getenv('COINGECKO_IDS_EXTRA', '').split(','):
         _base, _id = _par.split(':', 1)
         COINGECKO_IDS[_base.strip().upper()] = _id.strip()
 
+# --- Seleção dinâmica de símbolos por "melhor oportunidade" ---
+# Desligada por padrão (SELECAO_DINAMICA_ATIVA=false) para não mudar o
+# comportamento de quem já está rodando com a lista fixa. Quando ligada, a
+# cada INTERVALO_SELECAO_DINAMICA_MINUTOS o bot re-avalia um "universo" de
+# símbolos candidatos (UNIVERSO_DINAMICO_SIMBOLOS) por volume 24h ou variação
+# 24h, aplica o mesmo piso de market cap acima, e adiciona os melhores
+# QTD_SIMBOLOS_DINAMICOS colocados à lista fixa (SIMBOLOS_FIXOS) — nunca
+# remove um símbolo fixo, e nunca remove um símbolo com posição aberta.
+SELECAO_DINAMICA_ATIVA = os.getenv('SELECAO_DINAMICA_ATIVA', 'false').lower() == 'true'
+UNIVERSO_DINAMICO_SIMBOLOS = [s.strip() for s in os.getenv(
+    'UNIVERSO_DINAMICO_SIMBOLOS',
+    'AVAX/USDC:USDC,ARB/USDC:USDC,OP/USDC:USDC,DOGE/USDC:USDC,XRP/USDC:USDC,'
+    'LINK/USDC:USDC,SUI/USDC:USDC,APT/USDC:USDC,NEAR/USDC:USDC,TIA/USDC:USDC,'
+    'INJ/USDC:USDC,SEI/USDC:USDC,HYPE/USDC:USDC'
+).split(',') if s.strip()]
+QTD_SIMBOLOS_DINAMICOS = int(os.getenv('QTD_SIMBOLOS_DINAMICOS', 2))
+# 'volume_24h'   -> prioriza os candidatos com maior volume 24h (liquidez/interesse)
+# 'variacao_24h' -> prioriza os candidatos com maior |variação| de preço nas últimas 24h (momentum)
+CRITERIO_SELECAO_DINAMICA = os.getenv('CRITERIO_SELECAO_DINAMICA', 'volume_24h')
+INTERVALO_SELECAO_DINAMICA_MINUTOS = float(os.getenv('INTERVALO_SELECAO_DINAMICA_MINUTOS', 60))
+
 # Trava de segurança: nenhuma estratégia pode configurar alavancagem acima disso,
 # mesmo que a variável de ambiente correspondente esteja mal configurada.
 MAX_LEVERAGE_PERMITIDO = int(os.getenv('MAX_LEVERAGE_PERMITIDO', 10))
@@ -268,6 +303,50 @@ try:
     log.info(f"Mercados da Hyperliquid carregados ({len(exchange.markets)} pares disponíveis).")
 except Exception as e:
     log.error(f"Falha ao carregar mercados da Hyperliquid no startup: {e}")
+
+
+def resolver_e_validar_symbols(symbols_desejados: list) -> list:
+    """Valida cada símbolo contra os mercados realmente carregados da Hyperliquid.
+    Mercados HIP-3 (deploy de terceiros, ex: ações tokenizadas como SKHYNIX) às
+    vezes usam um formato com prefixo de dex (ex: "xyz:SKHYNIX/USDC:USDC") que
+    não bate exatamente com o que a gente escreveria "no chute" — em vez de
+    travar o bot inteiro por causa de 1 símbolo, tentamos achar por aproximação
+    do nome base e avisamos qual símbolo exato foi usado (ou ignoramos esse
+    par pontualmente, sem derrubar os outros)."""
+    symbols_validos = []
+    for symbol in symbols_desejados:
+        if symbol in exchange.markets:
+            symbols_validos.append(symbol)
+            continue
+
+        base_procurada = symbol.split('/')[0].split(':')[-1].upper()
+        candidatos = [
+            m for m in exchange.markets
+            if base_procurada == m.split('/')[0].split(':')[-1].upper()
+        ]
+
+        if len(candidatos) == 1:
+            log.warning(f"Símbolo '{symbol}' não encontrado exatamente nos mercados da Hyperliquid. "
+                        f"Usando '{candidatos[0]}' (achado por aproximação do nome base '{base_procurada}').")
+            symbols_validos.append(candidatos[0])
+        elif len(candidatos) > 1:
+            log.error(f"Símbolo '{symbol}' não encontrado exatamente e há {len(candidatos)} candidatos "
+                      f"ambíguos: {candidatos[:10]}. Configure o símbolo EXATO na variável SYMBOLS. "
+                      f"Este par foi IGNORADO até a configuração ser corrigida.")
+            enviar_mensagem_telegram(
+                f"⚠️ Símbolo `{symbol}` ambíguo ({len(candidatos)} candidatos). "
+                f"Configure o exato em SYMBOLS. Ignorado por enquanto."
+            )
+        else:
+            log.error(f"Símbolo '{symbol}' não encontrado nos mercados da Hyperliquid (nem por "
+                      f"aproximação). Este par foi IGNORADO. Confira o nome exato no app da Hyperliquid.")
+            enviar_mensagem_telegram(
+                f"⚠️ Símbolo `{symbol}` não encontrado na Hyperliquid. Ignorado por enquanto — "
+                f"confira o nome exato do mercado (pode ter prefixo de dex, ex: `xyz:{symbol}`)."
+            )
+
+    return symbols_validos
+
 
 # --- Monitoramento de saúde do loop principal ---
 HEARTBEAT_HORAS = float(os.getenv('HEARTBEAT_HORAS', 6))
@@ -326,6 +405,16 @@ if NOTIFICAR_ERROS_NO_TELEGRAM:
     _tg_handler = TelegramLogHandler(level=logging.ERROR)
     _tg_handler.setFormatter(logging.Formatter("%(message)s"))
     log.addHandler(_tg_handler)
+
+# Só agora (com enviar_mensagem_telegram já disponível) rodamos a validação
+# dos símbolos configurados contra os mercados carregados da Hyperliquid.
+if exchange.markets:
+    SYMBOLS[:] = resolver_e_validar_symbols(SYMBOLS)
+    SIMBOLOS_FIXOS[:] = [s for s in SIMBOLOS_FIXOS if s in SYMBOLS] or list(SYMBOLS)
+    log.info(f"Símbolos ativos após validação: {', '.join(SYMBOLS) if SYMBOLS else '(nenhum válido!)'}")
+else:
+    log.error("Mercados não carregados — símbolos não puderam ser validados. "
+              "Usando a lista bruta de SYMBOLS por enquanto; erros de símbolo aparecerão nas chamadas seguintes.")
 
 
 # =====================================================================
@@ -455,10 +544,22 @@ def obter_preco_referencia(symbol: str) -> float:
     return float(ticker['last'])
 
 
+_ja_logou_balance_bruto = False
+
+
 def obter_saldo_disponivel_usdt() -> float:
+    global _ja_logou_balance_bruto
     saldo = exchange.fetch_balance()
     info_quote = saldo.get(QUOTE, {})
     disponivel = info_quote.get('free') or info_quote.get('total') or 0
+
+    if float(disponivel) <= 0 and not _ja_logou_balance_bruto:
+        # Log único (evita spam a cada ciclo): ajuda a diferenciar "saldo
+        # realmente zerado" de "bug de nome de campo no retorno da API".
+        _ja_logou_balance_bruto = True
+        log.warning(f"Saldo em {QUOTE} lido como 0. Retorno bruto de fetch_balance() (debug único): "
+                    f"chaves disponíveis={list(saldo.keys())} | conteúdo de '{QUOTE}'={info_quote}")
+
     return float(disponivel)
 
 
@@ -469,6 +570,133 @@ def configurar_alavancagem_isolada(symbol: str, leverage: int):
     except Exception as e:
         log.warning(f"[{symbol}] Aviso ao configurar margem/alavancagem ({leverage}x): {e}")
     return leverage
+
+
+# --- Filtro de liquidez / market cap (via CoinGecko, ver bloco de config) ---
+_mcap_cache = {}  # base (str) -> (valor_usd: float | None, timestamp: float)
+
+
+def obter_market_cap(base: str):
+    """Retorna o market cap em USD do token (via CoinGecko, com cache), ou
+    None se não for possível determinar (símbolo sem mapeamento, erro de rede,
+    etc.). Retornar None é tratado como 'não bloquear a entrada' (fail-open) —
+    a ideia é ajudar a evitar tokens pequenos, não travar o bot inteiro se o
+    CoinGecko estiver fora do ar ou faltar mapeamento pra um símbolo novo."""
+    base = base.upper()
+
+    cache_hit = _mcap_cache.get(base)
+    if cache_hit and (time.time() - cache_hit[1]) < MARKET_CAP_CACHE_MINUTOS * 60:
+        return cache_hit[0]
+
+    coingecko_id = COINGECKO_IDS.get(base)
+    if not coingecko_id:
+        log.warning(f"[market cap] '{base}' sem id do CoinGecko mapeado (COINGECKO_IDS/"
+                    f"COINGECKO_IDS_EXTRA). Filtro de liquidez ignorado para este símbolo.")
+        _mcap_cache[base] = (None, time.time())
+        return None
+
+    try:
+        resp = requests.get(
+            'https://api.coingecko.com/api/v3/simple/price',
+            params={'ids': coingecko_id, 'vs_currencies': 'usd', 'include_market_cap': 'true'},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        dados = resp.json()
+        mcap = (dados.get(coingecko_id) or {}).get('usd_market_cap')
+        valor = float(mcap) if mcap is not None else None
+        _mcap_cache[base] = (valor, time.time())
+        return valor
+    except Exception as e:
+        log.warning(f"[market cap] Erro ao consultar CoinGecko para '{base}' ({coingecko_id}): {e}")
+        # Em erro de rede, reaproveita o valor antigo do cache se houver,
+        # em vez de bloquear a entrada por uma falha temporária da API externa.
+        return cache_hit[0] if cache_hit else None
+
+
+def passa_no_filtro_market_cap(symbol: str) -> bool:
+    if not FILTRO_MARKET_CAP_ATIVO:
+        return True
+    base = symbol.split('/')[0].split(':')[-1]
+    mcap = obter_market_cap(base)
+    if mcap is None:
+        return True  # fail-open: sem dado, não bloqueia
+    if mcap < MARKET_CAP_MINIMO_USD:
+        log.info(f"[{symbol}] Bloqueado pelo filtro de market cap: "
+                 f"${mcap:,.0f} < piso de ${MARKET_CAP_MINIMO_USD:,.0f}.")
+        return False
+    return True
+
+
+# --- Seleção dinâmica de símbolos por "melhor oportunidade" (ver config) ---
+def selecionar_melhores_oportunidades() -> list:
+    """Avalia o UNIVERSO_DINAMICO_SIMBOLOS por volume ou variação 24h, aplica
+    o filtro de market cap, e retorna até QTD_SIMBOLOS_DINAMICOS símbolos —
+    os melhores colocados no critério escolhido. Nunca inclui um símbolo que
+    já esteja em SIMBOLOS_FIXOS (esses já são operados de qualquer forma)."""
+    candidatos = []
+    for symbol in UNIVERSO_DINAMICO_SIMBOLOS:
+        if symbol in SIMBOLOS_FIXOS:
+            continue
+        if symbol not in exchange.markets:
+            continue  # símbolo do universo não existe/mudou de nome na Hyperliquid
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            volume_24h = float(ticker.get('quoteVolume') or 0)
+            variacao_24h = abs(float(ticker.get('percentage') or 0))
+            candidatos.append((symbol, volume_24h, variacao_24h))
+        except Exception as e:
+            log.warning(f"[seleção dinâmica] Erro ao avaliar {symbol}: {e}")
+
+    if not candidatos:
+        return []
+
+    if CRITERIO_SELECAO_DINAMICA == 'variacao_24h':
+        candidatos.sort(key=lambda c: c[2], reverse=True)
+    else:
+        candidatos.sort(key=lambda c: c[1], reverse=True)
+
+    aprovados = []
+    for symbol, volume_24h, variacao_24h in candidatos:
+        if not passa_no_filtro_market_cap(symbol):
+            continue
+        aprovados.append(symbol)
+        log.info(f"[seleção dinâmica] Candidato aprovado: {symbol} "
+                 f"(volume24h≈${volume_24h:,.0f}, variação24h≈{variacao_24h:.2f}%)")
+        if len(aprovados) >= QTD_SIMBOLOS_DINAMICOS:
+            break
+
+    return aprovados
+
+
+def atualizar_selecao_dinamica():
+    """Atualiza SYMBOLS in-place: mantém SIMBOLOS_FIXOS + posições abertas +
+    os melhores candidatos do momento. Muta a lista existente (SYMBOLS[:] = ...)
+    em vez de reatribuir, porque várias funções guardam referência a esse
+    mesmo objeto de lista."""
+    if not SELECAO_DINAMICA_ATIVA:
+        return
+
+    try:
+        simbolos_com_posicao_aberta = [s for s, aberta in obter_posicoes_map().items() if aberta]
+    except Exception as e:
+        log.warning(f"[seleção dinâmica] Erro ao checar posições abertas antes de atualizar: {e}")
+        simbolos_com_posicao_aberta = []
+
+    melhores = selecionar_melhores_oportunidades()
+
+    novos_symbols = list(SIMBOLOS_FIXOS)
+    for s in simbolos_com_posicao_aberta + melhores:
+        if s not in novos_symbols:
+            novos_symbols.append(s)
+
+    if set(novos_symbols) != set(SYMBOLS):
+        log.info(f"[seleção dinâmica] Lista de símbolos atualizada: {', '.join(novos_symbols)}")
+        enviar_mensagem_telegram(
+            f"🔄 *Seleção dinâmica atualizou os pares operados:*\n`{', '.join(novos_symbols)}`\n"
+            f"(fixos: `{', '.join(SIMBOLOS_FIXOS)}`)"
+        )
+    SYMBOLS[:] = novos_symbols
 
 
 # =====================================================================
@@ -886,6 +1114,9 @@ def processar_par(symbol: str, aberta_agora: bool, ordens_do_par: list, total_po
     if total_posicoes_abertas >= MAX_POSICOES_SIMULTANEAS:
         return
 
+    if not passa_no_filtro_market_cap(symbol):
+        return
+
     log.info(f"[{symbol}] Buscando candles e avaliando estratégias ({', '.join(obter_ordem_estrategias_atual())})...")
     resultado = avaliar_estrategias(symbol)
     if not resultado:
@@ -897,7 +1128,12 @@ def processar_par(symbol: str, aberta_agora: bool, ordens_do_par: list, total_po
 
     notional = risk_manager.calcular_tamanho_posicao(saldo, resultado['pct_sl'])
     if notional <= 0:
-        log.warning(f"[{symbol}] Notional calculado inválido, entrada abortada.")
+        log.warning(
+            f"[{symbol}] Notional calculado inválido ({notional:.4f}), entrada abortada. "
+            f"Saldo lido na conta Perps: {saldo:.4f} {QUOTE} | pct_sl: {resultado['pct_sl']*100:.3f}%. "
+            f"Se o saldo estiver em 0, confira se o USDC está na carteira PERPS da Hyperliquid "
+            f"(não na Spot) e vinculado ao WALLET_ADDRESS configurado."
+        )
         return
 
     executar_ordem_com_tp_sl(
@@ -925,6 +1161,8 @@ def enviar_resumo_diario():
 def executar_bot():
     log.info("=" * 60)
     log.info(f"BOT SNIPER BOLADÃO (HYPERLIQUID) INICIADO | Pares: {', '.join(SYMBOLS)}")
+    log.info(f"Símbolos fixos: {', '.join(SIMBOLOS_FIXOS)} | Seleção dinâmica: "
+             f"{'ATIVA' if SELECAO_DINAMICA_ATIVA else 'desativada'}")
     log.info(f"Ordem de prioridade padrão: {', '.join(ESTRATEGIAS_ORDEM_PADRAO)}")
     log.info(f"Ordem de prioridade no turno da tarde ({TURNO_TARDE_INICIO_HORA}h-{TURNO_TARDE_FIM_HORA}h, {TIMEZONE_OPERACIONAL}): "
              f"{', '.join(ESTRATEGIAS_ORDEM_TARDE)}")
@@ -942,6 +1180,7 @@ def executar_bot():
         f"Estratégias (ordem atual): `{', '.join(obter_ordem_estrategias_atual())}`\n"
         f"(padrão: `{', '.join(ESTRATEGIAS_ORDEM_PADRAO)}` | tarde {TURNO_TARDE_INICIO_HORA}h-{TURNO_TARDE_FIM_HORA}h: "
         f"`{', '.join(ESTRATEGIAS_ORDEM_TARDE)}`)\n"
+        f"Seleção dinâmica de pares: `{'ativa' if SELECAO_DINAMICA_ATIVA else 'desativada'}`\n"
         f"Máx. posições simultâneas: `{MAX_POSICOES_SIMULTANEAS}`\n"
         f"Risco por trade: `{RISCO_POR_TRADE_PCT*100:.1f}%` | Drawdown máx. diário: `{MAX_DRAWDOWN_DIARIO_PCT*100:.1f}%`\n"
         f"{'⚠️ MODO TESTNET' if USE_TESTNET else ''}"
@@ -950,6 +1189,7 @@ def executar_bot():
     erros_consecutivos = 0
     ultima_data_resumo = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     ultimo_heartbeat = time.time()
+    ultima_selecao_dinamica = 0.0  # força uma primeira atualização já no início, se ativa
     alertou_rate_limit = False
 
     while True:
@@ -987,6 +1227,13 @@ def executar_bot():
                 except Exception as e:
                     log.warning(f"Erro ao montar heartbeat: {e}")
                 ultimo_heartbeat = time.time()
+
+            if SELECAO_DINAMICA_ATIVA and (time.time() - ultima_selecao_dinamica) >= INTERVALO_SELECAO_DINAMICA_MINUTOS * 60:
+                try:
+                    atualizar_selecao_dinamica()
+                except Exception as e:
+                    log.warning(f"Erro ao atualizar seleção dinâmica de símbolos: {e}")
+                ultima_selecao_dinamica = time.time()
 
             mapa_posicoes = obter_posicoes_map()
             mapa_ordens = obter_ordens_abertas_map()
