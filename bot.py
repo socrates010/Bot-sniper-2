@@ -116,8 +116,26 @@ def obter_ordem_estrategias_atual() -> list:
     return ESTRATEGIAS_ORDEM_PADRAO
 
 
+# ATENÇÃO: a Hyperliquid só aceita intervalos específicos de candle:
+# 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M. Qualquer outro
+# valor (ex: "2m") faz a API retornar 422 (erro de deserialização, não de
+# rede/conta) — o bot valida isso já no startup para falhar rápido e claro.
+_INTERVALOS_VALIDOS_HYPERLIQUID = {
+    '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '8h', '12h', '1d', '3d', '1w', '1M',
+}
+
+
+def _validar_timeframe(nome_var: str, valor: str) -> str:
+    if valor not in _INTERVALOS_VALIDOS_HYPERLIQUID:
+        raise RuntimeError(
+            f"{nome_var}='{valor}' não é um intervalo válido na Hyperliquid. "
+            f"Use um destes: {', '.join(sorted(_INTERVALOS_VALIDOS_HYPERLIQUID))}"
+        )
+    return valor
+
+
 # --- Parâmetros da estratégia Sniper (BB breakout) ---
-TIMEFRAME = os.getenv('TIMEFRAME', '5m')
+TIMEFRAME = _validar_timeframe('TIMEFRAME', os.getenv('TIMEFRAME', '5m'))
 BB_LENGTH = int(os.getenv('BB_LENGTH', 20))
 BB_STD = float(os.getenv('BB_STD', 1.5))
 # Antes: exigia volume > média(20) * multiplicador. Isso ficava alto demais
@@ -144,10 +162,14 @@ PCT_SL = float(os.getenv('PCT_SL', 0.01))    # 1.0%
 # Ideia: opera em timeframe curto, entra na confirmação de cruzamento de médias
 # com momentum (RSI) a favor, e usa ATR para dimensionar TP/SL de forma
 # adaptativa à volatilidade do momento (em vez de % fixo).
-# Timeframe 3m -> 2m e EMA9/21 -> EMA5/13: no 2m, médias mais lentas demoram
-# demais para cruzar quando o mercado perde amplitude (típico de tarde) —
-# médias mais curtas cruzam com mais frequência, gerando mais gatilhos.
-SCALP_TIMEFRAME = os.getenv('SCALP_TIMEFRAME', '2m')
+# Timeframe 3m -> 2m (pedido original) e EMA9/21 -> EMA5/13: no timeframe
+# mais curto, médias mais lentas demoram demais para cruzar quando o mercado
+# perde amplitude (típico de tarde) — médias mais curtas cruzam com mais
+# frequência, gerando mais gatilhos. IMPORTANTE: "2m" não existe como
+# intervalo na Hyperliquid (ver validação acima) — usamos "1m", o intervalo
+# válido mais rápido disponível, para manter a intenção original (girar mais
+# rápido que 3m). Se ficar ruidoso demais, ajuste via env var SCALP_TIMEFRAME.
+SCALP_TIMEFRAME = _validar_timeframe('SCALP_TIMEFRAME', os.getenv('SCALP_TIMEFRAME', '1m'))
 SCALP_EMA_RAPIDA = int(os.getenv('SCALP_EMA_RAPIDA', 5))
 SCALP_EMA_LENTA = int(os.getenv('SCALP_EMA_LENTA', 13))
 SCALP_RSI_LENGTH = int(os.getenv('SCALP_RSI_LENGTH', 14))
