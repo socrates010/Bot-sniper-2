@@ -951,11 +951,52 @@ def obter_ordens_abertas_map() -> dict:
     return mapa
 
 
+def _cancelar_lista_ordens(symbol: str, ordens: list):
+    """Cancela uma lista de ordens já buscada. A Hyperliquid (via ccxt) não
+    implementa cancelAllOrders() ('is not supported yet') — por isso
+    cancelamos manualmente: tenta em lote via cancel_orders(ids, symbol) e,
+    se isso falhar por qualquer motivo, cai para cancelar uma a uma."""
+    ids = [o['id'] for o in ordens if o.get('id')]
+    if not ids:
+        return
+
+    try:
+        exchange.cancel_orders(ids, symbol)
+        return
+    except Exception as e:
+        if eh_erro_rate_limit(e):
+            registrar_pausa_rate_limit(e)
+            return
+        log.warning(f"[{symbol}] cancel_orders em lote falhou ({e}), cancelando ordem a ordem...")
+
+    for order_id in ids:
+        try:
+            exchange.cancel_order(order_id, symbol)
+        except Exception as e2:
+            if eh_erro_rate_limit(e2):
+                registrar_pausa_rate_limit(e2)
+                return
+            log.warning(f"[{symbol}] Erro ao cancelar ordem {order_id}: {e2}")
+
+
+def cancelar_todas_ordens(symbol: str):
+    """Busca as ordens abertas do símbolo e cancela todas (ver _cancelar_lista_ordens)."""
+    try:
+        ordens = exchange.fetch_open_orders(symbol)
+    except Exception as e:
+        if eh_erro_rate_limit(e):
+            registrar_pausa_rate_limit(e)
+        else:
+            log.warning(f"[{symbol}] Erro ao buscar ordens abertas para cancelar: {e}")
+        return
+    _cancelar_lista_ordens(symbol, ordens)
+
+
 def limpar_ordens_orfas(symbol: str, esta_aberta: bool, ordens_do_par: list):
     if not ordens_do_par or esta_aberta:
         return
     try:
-        exchange.cancel_all_orders(symbol)
+        _cancelar_lista_ordens(symbol, ordens_do_par)
         log.info(f"[{symbol}] Ordens órfãs canceladas ({len(ordens_do_par)}).")
     except Exception as e:
         if eh_erro_rate_limit(e):
@@ -992,7 +1033,7 @@ def executar_ordem_com_tp_sl(symbol: str, tipo_entrada: str, preco_entrada: floa
                               notional_usdt: float, pct_tp: float, pct_sl: float,
                               leverage: int, nome_estrategia: str):
     try:
-        exchange.cancel_all_orders(symbol)
+        cancelar_todas_ordens(symbol)
 
         preco_ref = obter_preco_referencia(symbol)
         quantidade_bruta = notional_usdt / preco_ref
