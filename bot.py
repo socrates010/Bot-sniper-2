@@ -563,6 +563,22 @@ def obter_saldo_disponivel_usdt() -> float:
     return float(disponivel)
 
 
+def obter_equity_total_usdc() -> float:
+    """Patrimônio TOTAL (livre + em uso como margem), para acompanhar
+    drawdown no RiskManager. NÃO usar isso para dimensionar uma nova posição
+    (para isso, use obter_saldo_disponivel_usdt(), que é o saldo LIVRE).
+    Por que a separação importa: assim que uma posição abre com margem
+    isolada, o saldo LIVRE despenca na hora (o valor não sumiu, só foi
+    reservado como margem) — usar saldo livre para medir drawdown gera falso
+    positivo de kill switch mesmo sem nenhuma perda real ter acontecido."""
+    saldo = exchange.fetch_balance()
+    info_quote = saldo.get(QUOTE, {})
+    total = info_quote.get('total')
+    if total is None:
+        total = (info_quote.get('free') or 0) + (info_quote.get('used') or 0)
+    return float(total or 0)
+
+
 def configurar_alavancagem_isolada(symbol: str, leverage: int):
     leverage = min(leverage, MAX_LEVERAGE_PERMITIDO)
     try:
@@ -1163,17 +1179,18 @@ def processar_par(symbol: str, aberta_agora: bool, ordens_do_par: list, total_po
     if not resultado:
         return
 
-    saldo = obter_saldo_disponivel_usdt()
-    if risk_manager.checar_kill_switch(saldo):
+    saldo_livre = obter_saldo_disponivel_usdt()
+    equity_total = obter_equity_total_usdc()
+    if risk_manager.checar_kill_switch(equity_total):
         return
 
-    notional = risk_manager.calcular_tamanho_posicao(saldo, resultado['pct_sl'])
+    notional = risk_manager.calcular_tamanho_posicao(saldo_livre, resultado['pct_sl'])
     if notional <= 0:
         log.warning(
             f"[{symbol}] Notional calculado inválido ({notional:.4f}), entrada abortada. "
-            f"Saldo lido na conta Perps: {saldo:.4f} {QUOTE} | pct_sl: {resultado['pct_sl']*100:.3f}%. "
-            f"Se o saldo estiver em 0, confira se o USDC está na carteira PERPS da Hyperliquid "
-            f"(não na Spot) e vinculado ao WALLET_ADDRESS configurado."
+            f"Saldo livre na conta Perps: {saldo_livre:.4f} {QUOTE} (equity total: {equity_total:.4f} {QUOTE}) | "
+            f"pct_sl: {resultado['pct_sl']*100:.3f}%. Se o saldo estiver em 0, confira se o USDC está na "
+            f"carteira PERPS da Hyperliquid (não na Spot) e vinculado ao WALLET_ADDRESS configurado."
         )
         return
 
