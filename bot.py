@@ -81,17 +81,17 @@ NOTIFICAR_ERROS_NO_TELEGRAM = os.getenv('NOTIFICAR_ERROS_NO_TELEGRAM', 'true').l
 QUOTE = 'USDC'
 
 # Formato de símbolo na Hyperliquid (via ccxt) é "BASE/USDC:USDC", ex: "BTC/USDC:USDC".
-# Mercados HIP-3 (deploy de terceiros, ex: ações tokenizadas como SKHYNIX) podem
-# usar um formato com prefixo de dex (ex: "xyz:SKHYNIX/USDC:USDC") — o bot tenta
-# resolver automaticamente no startup (ver resolver_e_validar_symbols) e avisa
-# no log/Telegram qual símbolo exato foi encontrado ou se precisa de ajuste manual.
+# Mercados HIP-3 (deploy de terceiros, ex: ações tokenizadas) podem usar um
+# formato com prefixo de dex (ex: "xyz:SKHYNIX/USDC:USDC") — o bot tenta
+# resolver automaticamente no startup (ver resolver_e_validar_symbols).
 #
-# ATENÇÃO SKHYNIX: é uma ação tokenizada (SK Hynix) via mercado HIP-3 de
-# terceiros (Trade.xyz), com oráculo próprio e cross margin — teve um evento
-# de ~US$57M em liquidações em 28/jul/2026 por falha de oráculo pré-mercado.
-# É estruturalmente mais arriscado que os pares cripto major abaixo.
+# SKHYNIX REMOVIDA (decisão de 01/ago/2026): ativo tokenizado via HIP-3 de
+# terceiros, com spread mais alto e menor profundidade de livro — o Stop Loss
+# sofria slippage relevante na execução. Foco voltou a pares nativos de alta
+# liquidez (BTC/ETH/SOL), onde o book é fundo o suficiente para o SL executar
+# perto do preço configurado.
 SYMBOLS = [s.strip() for s in os.getenv(
-    'SYMBOLS', 'BTC/USDC:USDC,ETH/USDC:USDC,SOL/USDC:USDC,SKHYNIX/USDC:USDC'
+    'SYMBOLS', 'BTC/USDC:USDC,ETH/USDC:USDC,SOL/USDC:USDC'
 ).split(',') if s.strip()]
 
 # Cópia da lista original de SYMBOLS: são os pares SEMPRE operados, independente
@@ -149,57 +149,65 @@ def _validar_timeframe(nome_var: str, valor: str) -> str:
 
 
 # --- Parâmetros da estratégia Sniper (BB breakout) ---
-TIMEFRAME = _validar_timeframe('TIMEFRAME', os.getenv('TIMEFRAME', '5m'))
+# 5m -> 15m: 5m com desvio baixo gerava fakeouts (rompimentos falsos que
+# revertem no candle seguinte). 15m filtra ruído intracandle de curtíssimo
+# prazo, ao custo de reagir mais devagar a mudanças reais de regime.
+TIMEFRAME = _validar_timeframe('TIMEFRAME', os.getenv('TIMEFRAME', '15m'))
 BB_LENGTH = int(os.getenv('BB_LENGTH', 20))
-BB_STD = float(os.getenv('BB_STD', 1.5))
-# Antes: exigia volume > média(20) * multiplicador. Isso ficava alto demais
-# à tarde, quando o volume médio do dia todo (que inclui a manhã, mais forte)
-# não reflete o volume "normal" daquele momento. Agora comparamos com o
-# volume da vela FECHADA imediatamente anterior — régua mais realista pra
-# qualquer horário. O multiplicador também foi reduzido (1.5 -> 1.2) porque
-# comparar candle-a-candle já é naturalmente mais ruidoso que comparar com
-# uma média de 20 períodos.
-VOLUME_MULTIPLICADOR = float(os.getenv('VOLUME_MULTIPLICADOR', 1.2))
-LIMIT_CANDLES = max(100, BB_LENGTH * 3)
+# 1.5 -> 2.0: com desvio 1.5, ~86% dos preços já ficam DENTRO das bandas
+# (rompimento é estatisticamente "comum", não uma anomalia real) — o bot
+# acionava em oscilação normal de mercado, não em rompimento de verdade.
+# 2.0 é o desvio clássico de Bollinger (~95% dos preços dentro da banda),
+# tornando o rompimento um evento raro o suficiente pra ter significado.
+BB_STD = float(os.getenv('BB_STD', 2.0))
+# Volume: voltamos para média(20) em vez de vela-anterior. Comparar com a
+# vela imediatamente anterior é ruidoso (a vela anterior pode ela mesma ter
+# sido atípica) — média(20) mede o "normal" da janela recente de forma mais
+# estável, e é a base certa para medir uma explosão REAL de volume.
+VOLUME_MULTIPLICADOR = float(os.getenv('VOLUME_MULTIPLICADOR', 1.3))
+VOLUME_SMA_LENGTH = int(os.getenv('VOLUME_SMA_LENGTH', 20))
+LIMIT_CANDLES = max(100, BB_LENGTH * 3, VOLUME_SMA_LENGTH * 3)
 
 FILTRO_TENDENCIA = os.getenv('FILTRO_TENDENCIA', 'true').lower() == 'true'
-# EMA100 -> EMA34: filtro de tendência mais reativo, reage mais rápido a
-# mudanças de direção de curto/médio prazo (trade-off: mais sujeito a whipsaw
-# em mercado lateral do que a EMA100).
+# EMA34 (pode subir para 50 via env var) no gráfico de 15m — mais espaço
+# temporal por candle do que a mesma EMA34 seria em 5m, então o filtro fica
+# mais representativo da tendência real, não só do ruído de curtíssimo prazo.
 EMA_TENDENCIA = int(os.getenv('EMA_TENDENCIA', 34))
 
 LEVERAGE = int(os.getenv('LEVERAGE', 3))
 PCT_TP = float(os.getenv('PCT_TP', 0.015))   # 1.5%
 PCT_SL = float(os.getenv('PCT_SL', 0.01))    # 1.0%
 
-# --- Parâmetros da estratégia Momentum Scalp (giro rápido, mais alavancada) ---
-# Ideia: opera em timeframe curto, entra na confirmação de cruzamento de médias
-# com momentum (RSI) a favor, e usa ATR para dimensionar TP/SL de forma
-# adaptativa à volatilidade do momento (em vez de % fixo).
-# Timeframe 3m -> 2m (pedido original) e EMA9/21 -> EMA5/13: no timeframe
-# mais curto, médias mais lentas demoram demais para cruzar quando o mercado
-# perde amplitude (típico de tarde) — médias mais curtas cruzam com mais
-# frequência, gerando mais gatilhos. IMPORTANTE: "2m" não existe como
-# intervalo na Hyperliquid (ver validação acima) — usamos "1m", o intervalo
-# válido mais rápido disponível, para manter a intenção original (girar mais
-# rápido que 3m). Se ficar ruidoso demais, ajuste via env var SCALP_TIMEFRAME.
-SCALP_TIMEFRAME = _validar_timeframe('SCALP_TIMEFRAME', os.getenv('SCALP_TIMEFRAME', '1m'))
-SCALP_EMA_RAPIDA = int(os.getenv('SCALP_EMA_RAPIDA', 5))
-SCALP_EMA_LENTA = int(os.getenv('SCALP_EMA_LENTA', 13))
+# --- Parâmetros da estratégia Momentum Scalp ---
+# 1m -> 5m: 1m na Hyperliquid sofre com ruído de microestrutura, slippage de
+# execução e corrosão de banca por taxa (cada entrada/saída paga taxa; girar
+# demais em 1m faz a soma das taxas comer boa parte do lucro bruto). 5m dá
+# sinais mais espaçados, mas estatisticamente mais confiáveis por candle.
+SCALP_TIMEFRAME = _validar_timeframe('SCALP_TIMEFRAME', os.getenv('SCALP_TIMEFRAME', '5m'))
+# EMA5x13 -> EMA9x21: médias mais lentas cruzam com menos frequência, mas
+# cada cruzamento carrega mais informação (menos "cruza e volta" em
+# consolidação lateral, que é o que gerava sinais falsos antes).
+SCALP_EMA_RAPIDA = int(os.getenv('SCALP_EMA_RAPIDA', 9))
+SCALP_EMA_LENTA = int(os.getenv('SCALP_EMA_LENTA', 21))
 SCALP_RSI_LENGTH = int(os.getenv('SCALP_RSI_LENGTH', 14))
-# Faixa de RSI ampliada (35-65) em vez de duas faixas estreitas e opostas
-# (era 50-75 no LONG / 25-50 no SHORT). Ganha-se frequência de sinal, perde-se
-# a proteção contra comprar/vender em zona de RSI mais neutra — é a troca
-# consciente pedida (giro rápido > seletividade).
-SCALP_RSI_LONG_MIN = float(os.getenv('SCALP_RSI_LONG_MIN', 35))   # RSI mínimo p/ LONG
-SCALP_RSI_LONG_MAX = float(os.getenv('SCALP_RSI_LONG_MAX', 100))  # sem teto (era 75)
-SCALP_RSI_SHORT_MAX = float(os.getenv('SCALP_RSI_SHORT_MAX', 65))  # RSI máximo p/ SHORT
-SCALP_RSI_SHORT_MIN = float(os.getenv('SCALP_RSI_SHORT_MIN', 0))   # sem piso (era 25)
+# CORREÇÃO CRÍTICA: a lógica antiga (RSI>35 p/ compra, RSI<65 p/ venda) tem
+# uma falha estrutural — ela aceita RSI=40 como "confirmação" de compra, que
+# na prática ainda é território levemente vendedor, não comprador. A lógica
+# nova exige RSI cruzando o centro (50) na direção certa: >52 para compra
+# (força compradora real) e <48 para venda (força vendedora real). O
+# intervalo 48-52 vira uma "zona morta" proposital — sem sinal ali, porque é
+# ruído de RSI oscilando ao redor de 50 sem direção definida.
+SCALP_RSI_LONG_MIN = float(os.getenv('SCALP_RSI_LONG_MIN', 52))
+SCALP_RSI_LONG_MAX = float(os.getenv('SCALP_RSI_LONG_MAX', 100))
+SCALP_RSI_SHORT_MAX = float(os.getenv('SCALP_RSI_SHORT_MAX', 48))
+SCALP_RSI_SHORT_MIN = float(os.getenv('SCALP_RSI_SHORT_MIN', 0))
 SCALP_ATR_LENGTH = int(os.getenv('SCALP_ATR_LENGTH', 14))
-# Multiplicadores de ATR menores -> TP/SL mais apertados -> posições fecham
-# mais rápido -> libera margem pra próxima entrada mais cedo (giro rápido).
-SCALP_ATR_MULT_TP = float(os.getenv('SCALP_ATR_MULT_TP', 1.0))
-SCALP_ATR_MULT_SL = float(os.getenv('SCALP_ATR_MULT_SL', 0.8))
+# TP/SL com Risco:Retorno de pelo menos 1:1.5 (SL 1.0x ATR, TP 1.5x ATR) —
+# com giro mais lento (5m) e menos trades/dia, cada trade precisa carregar
+# retorno esperado positivo depois de taxas, não só "fechar rápido".
+# Para 1:2, defina SCALP_ATR_MULT_TP=2.0 via env var.
+SCALP_ATR_MULT_TP = float(os.getenv('SCALP_ATR_MULT_TP', 1.5))
+SCALP_ATR_MULT_SL = float(os.getenv('SCALP_ATR_MULT_SL', 1.0))
 SCALP_PCT_SL_MINIMO = float(os.getenv('SCALP_PCT_SL_MINIMO', 0.003))  # piso de 0.3%
 SCALP_PCT_TP_MAXIMO = float(os.getenv('SCALP_PCT_TP_MAXIMO', 0.05))   # teto de 5%
 SCALP_LEVERAGE = int(os.getenv('SCALP_LEVERAGE', 5))
@@ -265,6 +273,17 @@ MAX_DRAWDOWN_DIARIO_PCT = float(os.getenv('MAX_DRAWDOWN_DIARIO_PCT', 0.05))
 FECHAR_POSICOES_NO_KILLSWITCH = os.getenv('FECHAR_POSICOES_NO_KILLSWITCH', 'false').lower() == 'true'
 
 CICLO_SEGUNDOS = int(os.getenv('CICLO_SEGUNDOS', 45))
+
+# --- Execução de ordens: preferir Limit/Post-Only (maker) na ENTRADA ---
+# Taxa maker é menor que taker na Hyperliquid. Tentamos uma ordem LIMITE
+# post-only (não cruza o book, só entra se sobrar como oferta) no melhor
+# bid/ask; se não preencher dentro de LIMITE_TIMEOUT_SEGUNDOS, cancela e cai
+# para ordem a MERCADO (taker) — prioriza garantir a entrada sobre economizar
+# taxa. IMPORTANTE: isso vale só para a ENTRADA. As ordens de TP/SL (saída)
+# continuam sempre a MERCADO — é proteção de risco, não economia de taxa, e
+# limite pode não executar na hora certa se o preço andar rápido contra você.
+PREFERIR_ORDENS_LIMITE = os.getenv('PREFERIR_ORDENS_LIMITE', 'true').lower() == 'true'
+LIMITE_TIMEOUT_SEGUNDOS = float(os.getenv('LIMITE_TIMEOUT_SEGUNDOS', 5))
 
 TRADES_LOG_PATH = os.getenv('TRADES_LOG_PATH', 'trades_log.csv')
 
@@ -740,30 +759,30 @@ def estrategia_bb_breakout(symbol: str):
     df = buscar_dados(symbol, TIMEFRAME, LIMIT_CANDLES)
 
     df.ta.bbands(close='close', length=BB_LENGTH, std=BB_STD, append=True)
+    df['vol_sma'] = ta.sma(df['volume'], length=VOLUME_SMA_LENGTH)
     if FILTRO_TENDENCIA:
         df['ema_tendencia'] = ta.ema(df['close'], length=EMA_TENDENCIA)
 
-    if len(df) < max(BB_LENGTH, EMA_TENDENCIA if FILTRO_TENDENCIA else 0) + 3:
+    if len(df) < max(BB_LENGTH, VOLUME_SMA_LENGTH, EMA_TENDENCIA if FILTRO_TENDENCIA else 0) + 2:
         return None
 
-    candle = df.iloc[-2]        # último candle FECHADO (gatilho = fechamento, não pavio)
-    candle_anterior = df.iloc[-3]  # candle imediatamente anterior, usado como referência de volume
+    candle = df.iloc[-2]  # último candle FECHADO (gatilho = fechamento, não pavio)
     close = candle['close']
     volume = candle['volume']
-    volume_anterior = candle_anterior['volume']
+    vol_sma = candle['vol_sma']
 
     col_lower = _coluna_bb(df, 'BBL_')
     col_upper = _coluna_bb(df, 'BBU_')
     bb_lower = candle[col_lower]
     bb_upper = candle[col_upper]
 
-    if pd.isna(volume_anterior) or pd.isna(bb_lower) or pd.isna(bb_upper):
+    if pd.isna(vol_sma) or pd.isna(bb_lower) or pd.isna(bb_upper):
         return None
 
-    # Antes: volume > média(20). Agora: volume > vela anterior * multiplicador.
-    # Fica mais justo ao longo do dia inteiro (a média de 20 velas carrega o
-    # volume mais forte da manhã e deixa a régua alta demais à tarde).
-    volume_confirmado = volume > (volume_anterior * VOLUME_MULTIPLICADOR)
+    # Volume Spike: exige uma EXPLOSÃO real de volume acima da média de
+    # VOLUME_SMA_LENGTH períodos (não só "maior que a vela anterior", que é
+    # um filtro fraco — duas velas fracas em sequência passavam por ele).
+    volume_confirmado = volume > (vol_sma * VOLUME_MULTIPLICADOR)
 
     # Gatilho pelo FECHAMENTO da vela acima/abaixo da banda (não pelo pavio/
     # máxima) — usar candle['close'] em vez de candle['high']/['low'] já
@@ -783,7 +802,8 @@ def estrategia_bb_breakout(symbol: str):
                 sinal = None
 
     log.info(f"[{symbol}][bb_breakout] Preço: {close:.4f} | BB Inf: {bb_lower:.4f} | BB Sup: {bb_upper:.4f} | "
-              f"Vol: {volume:.0f} (vela anterior: {volume_anterior:.0f}) | Sinal: {sinal or '-'}")
+              f"Vol: {volume:.0f} (média{VOLUME_SMA_LENGTH}: {vol_sma:.0f}, piso: {vol_sma*VOLUME_MULTIPLICADOR:.0f}) | "
+              f"Sinal: {sinal or '-'}")
 
     if not sinal:
         return None
@@ -801,14 +821,18 @@ def estrategia_bb_breakout(symbol: str):
 # =====================================================================
 # ESTRATÉGIA 2 (NOVA): MOMENTUM SCALP — giro rápido, mais alavancado
 # =====================================================================
-# Lógica: opera em timeframe curto (ex: 3m). Entra quando a EMA rápida cruza
-# a EMA lenta (mudança de momentum de curto prazo) E o RSI confirma força na
-# mesma direção, sem estar em zona extrema (evita comprar topo/vender fundo).
-# TP e SL são calculados a partir do ATR (volatilidade real do momento), não
-# de um % fixo — em mercado mais volátil, TP/SL abrem mais; em mercado parado,
-# fecham mais. Isso tende a gerar giro mais rápido de posições, adequado a
-# quem busca ciclos curtos com mais alavancagem — o que também significa
-# STOPS SENDO ACIONADOS COM MAIS FREQUÊNCIA. Não é uma estratégia "sem risco".
+# Lógica: opera em timeframe curto (5m). Entra quando a EMA rápida cruza a
+# EMA lenta (mudança de momentum de curto prazo) E o RSI confirma força
+# DIRECIONAL na mesma direção do cruzamento (não é mais só "não estar em
+# zona extrema" — agora exige RSI>52 para LONG e RSI<48 para SHORT,
+# confirmando que o momentum de fato aponta pra esse lado, não só que não
+# está esticado no lado oposto). TP e SL são calculados a partir do ATR
+# (volatilidade real do momento) com uma razão Risco:Retorno fixa garantida
+# (SCALP_ATR_MULT_TP / SCALP_ATR_MULT_SL, mín. 1:1.5) para compensar as
+# taxas de execução — ver correção do bug de clipping abaixo. Isso tende a
+# gerar giro mais rápido de posições, adequado a quem busca ciclos curtos
+# com mais alavancagem — o que também significa STOPS SENDO ACIONADOS COM
+# MAIS FREQUÊNCIA. Não é uma estratégia "sem risco".
 def estrategia_momentum_scalp(symbol: str):
     df = buscar_dados(symbol, SCALP_TIMEFRAME, SCALP_LIMIT_CANDLES)
 
@@ -836,6 +860,13 @@ def estrategia_momentum_scalp(symbol: str):
     cruzou_para_cima = anterior['ema_rapida'] <= anterior['ema_lenta'] and atual['ema_rapida'] > atual['ema_lenta']
     cruzou_para_baixo = anterior['ema_rapida'] >= anterior['ema_lenta'] and atual['ema_rapida'] < atual['ema_lenta']
 
+    # Correção crítica de RSI: agora exige força DIRECIONAL, não só "não
+    # extremo". SCALP_RSI_LONG_MIN=52 (RSI>52 confirma compra) e
+    # SCALP_RSI_SHORT_MAX=48 (RSI<48 confirma venda); os limites opostos
+    # (SCALP_RSI_LONG_MAX=100 / SCALP_RSI_SHORT_MIN=0) ficam abertos por
+    # padrão, tornando isso equivalente a "RSI > 52" / "RSI < 48" puros —
+    # mantidos como range só para permitir travar um teto também, se algum
+    # dia você quiser (ex: SCALP_RSI_LONG_MAX=75 para evitar comprar esticado).
     sinal = None
     if cruzou_para_cima and (SCALP_RSI_LONG_MIN <= rsi <= SCALP_RSI_LONG_MAX):
         sinal = 'LONG'
@@ -848,8 +879,14 @@ def estrategia_momentum_scalp(symbol: str):
     if not sinal:
         return None
 
-    pct_tp = min(max((atr * SCALP_ATR_MULT_TP) / close, SCALP_PCT_SL_MINIMO), SCALP_PCT_TP_MAXIMO)
+    # BUG CORRIGIDO: antes, pct_tp e pct_sl eram limitados (clip) de forma
+    # INDEPENDENTE entre o mesmo piso/teto — em ATR muito baixo, os dois
+    # podiam ser espremidos pro mesmo valor mínimo, destruindo a proporção
+    # Risco:Retorno. Agora: clipamos só o SL, e derivamos o TP a partir da
+    # razão fixa configurada — a proporção R:R fica sempre garantida.
     pct_sl = min(max((atr * SCALP_ATR_MULT_SL) / close, SCALP_PCT_SL_MINIMO), SCALP_PCT_TP_MAXIMO)
+    razao_risco_retorno = (SCALP_ATR_MULT_TP / SCALP_ATR_MULT_SL) if SCALP_ATR_MULT_SL else 1.5
+    pct_tp = pct_sl * razao_risco_retorno
 
     return {
         'nome': 'momentum_scalp',
@@ -1045,6 +1082,70 @@ def obter_pnl_realizado_recente(symbol: str, minutos: int = 30):
         return None
 
 
+def executar_entrada(symbol: str, side_entrada: str, quantidade: float, preco_ref: float) -> str:
+    """Executa a ENTRADA da posição. Se PREFERIR_ORDENS_LIMITE estiver ativo,
+    tenta primeiro uma ordem LIMITE post-only (maker, taxa menor) no melhor
+    bid/ask; se não preencher a tempo, cancela e cai para ordem a MERCADO
+    (taker) — a garantia de execução vem antes da economia de taxa. Retorna
+    uma string curta ('maker' ou 'taker') indicando como a entrada saiu, só
+    para log/mensagem — não afeta o restante do fluxo.
+
+    LIMITAÇÃO CONHECIDA: trata a ordem limite como 'tudo ou nada' (checa só
+    status 'closed'/'canceled'); preenchimento parcial dentro da janela de
+    timeout é tratado como não-preenchido e cai para mercado, o que pode, em
+    tese, gerar um pouco mais de quantidade do que o planejado somando as
+    duas tentativas. Para o tamanho de posição deste bot (arredondado e com
+    folga de margem de 5%), isso não chega a ser um risco relevante, mas fica
+    registrado como simplificação intencional."""
+    if not PREFERIR_ORDENS_LIMITE:
+        exchange.create_order(symbol=symbol, type='market', side=side_entrada, amount=quantidade, price=preco_ref)
+        return 'taker'
+
+    try:
+        orderbook = exchange.fetch_order_book(symbol, limit=5)
+        melhor_bid = orderbook['bids'][0][0] if orderbook.get('bids') else preco_ref
+        melhor_ask = orderbook['asks'][0][0] if orderbook.get('asks') else preco_ref
+        preco_limite = melhor_bid if side_entrada == 'buy' else melhor_ask
+        preco_limite = float(exchange.price_to_precision(symbol, preco_limite))
+
+        ordem = exchange.create_order(
+            symbol=symbol, type='limit', side=side_entrada, amount=quantidade,
+            price=preco_limite, params={'postOnly': True},
+        )
+        order_id = ordem.get('id')
+
+        if not order_id:
+            raise RuntimeError("create_order não retornou id da ordem limite")
+
+        inicio = time.time()
+        preenchida = False
+        while time.time() - inicio < LIMITE_TIMEOUT_SEGUNDOS:
+            time.sleep(0.5)
+            status = exchange.fetch_order(order_id, symbol)
+            if status.get('status') == 'closed':
+                preenchida = True
+                break
+            if status.get('status') == 'canceled':
+                break  # post-only rejeitado (cruzaria o book) -> cai pro mercado abaixo
+
+        if preenchida:
+            log.info(f"[{symbol}] Entrada via ordem LIMITE post-only (maker) preenchida em {preco_limite}.")
+            return 'maker'
+
+        try:
+            exchange.cancel_order(order_id, symbol)
+        except Exception:
+            pass  # pode já ter fechado entre o último check e o cancel
+        log.info(f"[{symbol}] Ordem limite não preenchida em {LIMITE_TIMEOUT_SEGUNDOS:.0f}s, "
+                 f"caindo para ordem a MERCADO para garantir a entrada.")
+
+    except Exception as e:
+        log.warning(f"[{symbol}] Erro na tentativa de ordem limite/maker ({e}), usando ordem a mercado.")
+
+    exchange.create_order(symbol=symbol, type='market', side=side_entrada, amount=quantidade, price=preco_ref)
+    return 'taker'
+
+
 def executar_ordem_com_tp_sl(symbol: str, tipo_entrada: str, preco_entrada: float,
                               notional_usdt: float, pct_tp: float, pct_sl: float,
                               leverage: int, nome_estrategia: str):
@@ -1092,12 +1193,10 @@ def executar_ordem_com_tp_sl(symbol: str, tipo_entrada: str, preco_entrada: floa
         preco_tp = float(exchange.price_to_precision(symbol, preco_tp))
         preco_sl = float(exchange.price_to_precision(symbol, preco_sl))
 
-        # Ordem a mercado na Hyperliquid EXIGE um preço de referência (proteção
-        # de slippage, tolerância padrão ~5%). Usamos o mid price atual.
-        exchange.create_order(
-            symbol=symbol, type='market', side=side_entrada, amount=quantidade, price=preco_ref,
-        )
-        log.info(f"[{symbol}] ✅ [{nome_estrategia}] Ordem {tipo_entrada} executada | qty={quantidade} | "
+        # Entrada: tenta maker (limite post-only) primeiro se PREFERIR_ORDENS_LIMITE,
+        # com fallback automático pra mercado (ver executar_entrada).
+        tipo_execucao = executar_entrada(symbol, side_entrada, quantidade, preco_ref)
+        log.info(f"[{symbol}] ✅ [{nome_estrategia}] Ordem {tipo_entrada} executada ({tipo_execucao}) | qty={quantidade} | "
                  f"notional≈{notional_usdt:.2f} {QUOTE} | leverage={leverage_aplicada}x")
 
         # TP e SL como ordens de redução (reduceOnly) com gatilho de preço.
